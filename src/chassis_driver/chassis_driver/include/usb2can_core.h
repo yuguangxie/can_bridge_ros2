@@ -28,6 +28,7 @@
 #include <netinet/in.h>   
 #include <arpa/inet.h>   
 #include <vector>
+#include <cstring>
 #include <thread>
 
 namespace USB2CAN
@@ -68,16 +69,19 @@ static int count = 0;        // 数据列表中,泳衣存储列表序号
 
 static VCI_INIT_CONFIG config;
 
-static pthread_t threadid;
+static pthread_t threadid = 0;
+static pthread_t thread_debug_id = 0;
 static pthread_t thread_can_recv;
-static Param *param;
+static Param *param = nullptr;
 
-static double wheel_radius = 0;  // 车轮半径, 差速底盘中用以通过车轮rpm计算轮速
-static double left_wheel_torque, left_wheel_speed, left_wheel_dc;
-static double right_wheel_torque, right_wheel_speed, right_wheel_dc;
+// 轮速计算共享参数：接收线程更新，状态发布时读取。
+static double wheel_radius = 0;
+static double left_wheel_speed = 0;
+static double right_wheel_speed = 0;
 
 // void ExitHandler(int sig);
 
+// CAN_app 负责参数读取、CAN 初始化、收发线程启动与 ROS2 话题交互。
 class CAN_app : public rclcpp::Node
 {
 private:
@@ -119,15 +123,14 @@ private:
 
   std::vector<std::thread> tasks;
 
-  void initROS();
-
   void ecu_cb(const yunle_msgs::msg::Ecu::SharedPtr  msg);
   // void ecu_cb(const yunle_msgs::msg::ecu::ConstPtr &msg);
 
   void imu_cb(const sensor_msgs::msg::Imu::SharedPtr msg) const;
   // void imu_cb(const sensor_msgs::msg::Imu::ConstPtr &msg);
 
-  void convertStringToType(std::string str);
+  void convertStringToType(const std::string &str);
+  bool send_can_frame(const VCI_CAN_OBJ &send_data) const;
 
 public:
   CAN_app();
@@ -138,7 +141,7 @@ public:
   
   void init_eth_can();
   void run_eth_can();
-  void can_recv_func(int id);
+  void can_recv_func();
 
   void run();
 

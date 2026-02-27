@@ -2,29 +2,33 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
+#include <memory>
 
 namespace USB2CAN
 {
+namespace {
+constexpr double kRpmToMps = 2.0 * 3.141592654 / 60.0;
+
+inline uint32_t decode_can_id(const unsigned char *buf)
+{
+    return (static_cast<uint32_t>(buf[1]) << 24) |
+           (static_cast<uint32_t>(buf[2]) << 16) |
+           (static_cast<uint32_t>(buf[3]) << 8) |
+           static_cast<uint32_t>(buf[4]);
+}
+} // namespace
 void *receive_func(void *param_in)
 {
     Param *param = (Param *)param_in;
-    uint8_t mrun_num = param->mrun_num;
-    std::string name = param->name;
+    // 线程参数由主线程构造并在运行期间保持有效。
     VCI_CAN_OBJ rec[3000]; // 接收缓存
     int reclen = 0;        // 获取收到的数据的帧数
 
-    // ros::NodeHandle nh_t;
-    std::string battery_topic_;
-    std::string vehicle_status_topic_;
-    // nh_t.param<std::string>("battery_topic", battery_topic_, "/battery");
-    // nh_t.param<std::string>("vehicle_status_topic", vehicle_status_topic_, "/vehicle_status");
-
-    // ros::Publisher pub_battery_status_ = param->battery_status_publisher;
-    // ros::Publisher pub_vehicle_status_ = param->vehicle_status_publisher;
     rclcpp::Publisher<yunle_msgs::msg::Battery>::SharedPtr pub_battery_status_ = param->battery_status_publisher;
     rclcpp::Publisher<yunle_msgs::msg::VehicleStatus>::SharedPtr pub_vehicle_status_ = param->vehicle_status_publisher;
 
-    while (mrun_num & 0x0f)
+    // 直接读取共享标记，确保主线程可实时停止子线程。
+    while (param->mrun_num & 0x0f)
     {
         if ((reclen = VCI_Receive(VCI_USBCAN2, 0, param->main_can_port, rec, 3000, 100)) > 0) //设备类型,设备索引,can通道索引,接收缓存索引,接收缓存大小,WaitTime(保留参数)
         {
@@ -35,7 +39,8 @@ void *receive_func(void *param_in)
                     yunle_msgs::msg::VehicleStatus msg_vehicle_status = msg_factory.getMessage();
                     // msg_vehicle_status.Header.stamp = ros::Time::now();
                     //msg_vehicle_status.header.stamp = this->get_clock()->now();
-                    msg_vehicle_status.header.stamp = rclcpp::Clock().now();
+                    static rclcpp::Clock ros_clock(RCL_ROS_TIME);
+                    msg_vehicle_status.header.stamp = ros_clock.now();
                     
                     msg_vehicle_status.left_wheel_speed = left_wheel_speed;
                     msg_vehicle_status.right_wheel_speed = right_wheel_speed;
@@ -48,10 +53,10 @@ void *receive_func(void *param_in)
                     pub_battery_status_->publish(msg_battery_status);
                 }else if(rec[i].ID == 0x178) {      // 左轮转速
                     WheelStatus msg_factory(rec[i], WHEEL_LEFT);
-                    left_wheel_speed = msg_factory.get_rpm()*wheel_radius*2*3.141592654/60;
+                    left_wheel_speed = msg_factory.get_rpm() * wheel_radius * kRpmToMps;
                 }else if(rec[i].ID == 0x188) {      // 右轮转速
                     WheelStatus msg_factory(rec[i], WHEEL_RIGHT);
-                    right_wheel_speed = msg_factory.get_rpm()*wheel_radius*2*3.141592654/60;
+                    right_wheel_speed = msg_factory.get_rpm() * wheel_radius * kRpmToMps;
                 }
             }
         }
@@ -63,7 +68,6 @@ void *receive_func(void *param_in)
 void *thread_debug(void *param_in)
 {
     Param *param = (Param *)param_in;
-    uint8_t mrun_num = param->mrun_num;
     VCI_CAN_OBJ recv[3000]; // 接收缓存
     int reclen = 0;         // 获取收到的数据的帧数
     auto node = rclcpp::Node::make_shared("global_node");
@@ -105,7 +109,7 @@ void *thread_debug(void *param_in)
         // ROS_INFO_STREAM("[can_module] SUCCESS Start CAN-" << param->debug_can_port + 1);
         RCLCPP_INFO_STREAM(node->get_logger(), "[can_module] SUCCESS Start CAN-" << param->debug_can_port + 1);
     }
-    while (mrun_num & 0x0f)
+    while (param->mrun_num & 0x0f)
     {
         reclen = VCI_Receive(VCI_USBCAN2, 0, param->debug_can_port, recv, 3000, 100);
         if (reclen > 0)
@@ -137,7 +141,7 @@ void *thread_debug(void *param_in)
 
 CAN_app::CAN_app() : Node("chassis_driver")
 {
-    // initROS();
+    // 参数默认值尽量与 launch 保持一致，方便开箱即用。
     this->declare_parameter<int>("canbus_type", 1);
     this->declare_parameter<int>("main_can_id", 1);
     this->declare_parameter<int>("debug_can_id", 1);
@@ -162,6 +166,23 @@ CAN_app::~CAN_app()
     {
     case USB2CAN:
     {
+        // 先通知接收线程退出，再关闭底层设备，避免线程使用已关闭句柄。
+        if (param != nullptr) {
+            param->mrun_num = 0;
+        }
+        if (threadid != 0) {
+            pthread_join(threadid, nullptr);
+            threadid = 0;
+        }
+        if (thread_debug_id != 0) {
+            pthread_join(thread_debug_id, nullptr);
+            thread_debug_id = 0;
+        }
+        if (param != nullptr) {
+            delete param;
+            param = nullptr;
+        }
+
         printf("[can module] try to ResetCAN...");
         usleep(100000);                                   //延时100ms。
         VCI_ResetCAN(VCI_USBCAN2, CAN_id, main_can_port); //复位CAN通道。
@@ -184,63 +205,90 @@ CAN_app::~CAN_app()
     }
 }
 
-// void CAN_app::initROS()
-// {
-//     p_nh.param<bool>("debug_mode", param_debug, false);
-//     p_nh.param<int>("debug_can_id", debug_can_port, 1); // 默认读取can1数据来debug
-//     p_nh.param<int>("main_can_id", main_can_port, 2);
-//     p_nh.param<bool>("show_sending_msg", param_show_sending_msg, false);
-//     std::string car_type_str;
-//     p_nh.param<std::string>("car_type", car_type_str, "JD03");
-//     convertStringToType(car_type_str);
+void CAN_app::convertStringToType(const std::string &str)
+{
+    // 默认车型，避免参数缺失时使用未初始化枚举值。
+    car_type = JD03;
 
-//     main_can_port = main_can_port - 1;
-//     debug_can_port = debug_can_port - 1;
-
-//     sub_ecu = nh.subscribe("ecu", 10, &CAN_app::ecu_cb, this);
-//     pub_vehicle_status = nh.advertise<yunle_msgs::vehicle_status>("vehicle_status", 100);
-//     pub_battery_status = nh.advertise<yunle_msgs::battery>("battery_status", 100);
-
-//     pre_steer = 0.;
-// }
-
-void CAN_app::convertStringToType(std::string str){
-    if(str == "NWD"){
+    if (str == "NWD") {
         car_type = NWD;
-    }else if(str == "JD03"){
+    } else if (str == "JD03") {
         car_type = JD03;
-    }else if(str == "JD01"){
+    } else if (str == "JD01") {
         car_type = JD01;
-    }else if(str == "JD02"){
+    } else if (str == "JD02") {
         car_type = JD02;
-    }else if(str == "TD"){
+    } else if (str == "TD") {
         car_type = TD;
+    } else {
+        RCLCPP_WARN_STREAM(this->get_logger(),
+                           "Unknown car_type '" << str << "', fallback to JD03.");
+    }
+}
+
+bool CAN_app::send_can_frame(const VCI_CAN_OBJ &send_data) const
+{
+    switch (canbus_type)
+    {
+    case USB2CAN:
+    {
+        VCI_CAN_OBJ tx_data = send_data;
+        if (VCI_Transmit(VCI_USBCAN2, CAN_id, main_can_port, &tx_data, 1) == 1)
+        {
+            return true;
+        }
+        RCLCPP_WARN_STREAM(this->get_logger(), "[can_module] Transmit failed once.");
+        return false;
+    }
+
+    case EthCAN_UDP:
+    {
+        BYTE d[13] = {0};
+        d[0] = static_cast<BYTE>(send_data.DataLen);
+        d[1] = static_cast<BYTE>((0xff000000 & send_data.ID) >> 24);
+        d[2] = static_cast<BYTE>((0x00ff0000 & send_data.ID) >> 16);
+        d[3] = static_cast<BYTE>((0x0000ff00 & send_data.ID) >> 8);
+        d[4] = static_cast<BYTE>(0x000000ff & send_data.ID);
+        std::memcpy(&d[5], send_data.Data, send_data.DataLen);
+        const int send_num = sendto(sock_fd, d, sizeof(d), 0,
+                                    reinterpret_cast<const struct sockaddr *>(&can2_addr_serv),
+                                    can2_addr_serv_len);
+        if (send_num < 0)
+        {
+            RCLCPP_WARN(this->get_logger(), "[CAN_DRIVER] Send data failed, res: %d", send_num);
+            return false;
+        }
+        return true;
+    }
+    default:
+        return false;
     }
 }
 
 void CAN_app::ecu_cb(const yunle_msgs::msg::Ecu::SharedPtr msg)
 {
+    // 回调尽量只做协议转换与发送，避免重逻辑阻塞订阅线程。
     yunle_msgs::msg::Ecu _msg = *msg;
     // _msg.steer = _msg.steer * 3.14 / 180.0;
     // _msg.steer -= 13;
     //SendMsg sendMsg(_msg, pre_steer);
-    SendMsgBase* sendMsg = nullptr;
+    std::unique_ptr<SendMsgBase> sendMsg;
     switch (car_type)
     {
     case NWD:
-        sendMsg = new MsgNWD(_msg, pre_steer);
+        sendMsg = std::make_unique<MsgNWD>(_msg, pre_steer);
         break;
     case JD02:
-        sendMsg = new MsgJD02(_msg, pre_steer);
+        sendMsg = std::make_unique<MsgJD02>(_msg, pre_steer);
         wheel_radius = 0.0505;  // 单位m
         break;
     case JD03:  //JD03和JD01做同样的处理
-        // sendMsg = new MsgJD01(_msg, pre_steer);
+        // sendMsg = std::make_unique<MsgJD01>(_msg, pre_steer);
         // wheel_radius = 0.065;
         // break;
     case TD:    //和JD01做相同的处理
     case JD01:
-        sendMsg = new MsgJD01(_msg, pre_steer);
+        sendMsg = std::make_unique<MsgJD01>(_msg, pre_steer);
         break;
     default:
         // ROS_WARN_STREAM("This driver only supports NWD/JD01/JD02/JD03. Confirm your vehicle type.");
@@ -248,66 +296,12 @@ void CAN_app::ecu_cb(const yunle_msgs::msg::Ecu::SharedPtr msg)
         return;
     }
 
-    // if(car_type == NWD){
-    //     sendMsg = new MsgNWD(_msg, pre_steer);
-    // }else if(car_type == JD03){
-    //     sendMsg = new MsgJD03(_msg, pre_steer);
-    // }else{
-    //     ROS_WARN_STREAM("This driver only supports NWD series and JD03. Confirm your vehicle type.");
-    //     return;
-    // }
-
     pre_steer = _msg.steer;
     //VCI_CAN_OBJ sendData = sendMsg.getMessage();
     VCI_CAN_OBJ sendData = sendMsg->getMessage();
     // ROS_INFO_STREAM("set wheel angle to can, data = " << _msg.steer * 10);
 
-    switch (canbus_type)
-    {
-    case USB2CAN:
-        if (VCI_Transmit(VCI_USBCAN2, CAN_id, main_can_port, &sendData, 1) != 1)
-        {
-            // ROS_INFO("send can id: %02x", CAN_id);
-            // ROS_WARN_STREAM("[can_module] Transmit failed once.");
-            // ROS_INFO_STREAM("VCI_USBCAN2 : " << VCI_USBCAN2);
-            // ROS_INFO_STREAM("CAN_id     : " << CAN_id);
-            // ROS_INFO_STREAM("CAN_port   : " << main_can_port + 1);
-            // ROS_INFO_STREAM("sendData : ");
-            RCLCPP_WARN_STREAM(this->get_logger(), "[can_module] Transmit failed once.");
-            RCLCPP_INFO_STREAM(this->get_logger(), "VCI_USBCAN2 : " << VCI_USBCAN2);
-            RCLCPP_INFO_STREAM(this->get_logger(), "CAN_id     : " << CAN_id);
-            RCLCPP_INFO_STREAM(this->get_logger(), "CAN_port   : " << main_can_port + 1);
-            RCLCPP_INFO_STREAM(this->get_logger(), "sendData : ");
-
-            // sendMsg.print(); // 以十六进制的形式打印ecu->can消息
-        }
-        break;
-    case EthCAN_UDP:
-    {
-        // BYTE *d;
-        // ROS_INFO("1");
-        // memset(d, 0, sizeof(BYTE)*13);
-        // ROS_INFO("2");
-        BYTE d[13];
-        d[0] = (BYTE)sendData.DataLen;
-        d[1] = (BYTE)((0xff000000 & sendData.ID) >> 24);
-        d[2] = (BYTE)((0xff0000 & sendData.ID) >> 16);
-        d[3] = (BYTE)((0xff00 & sendData.ID) >> 8);
-        d[4] = (BYTE)((0xff & sendData.ID));
-        for (int i = 0; i < sendData.DataLen; i++) {
-            d[5+i] = sendData.Data[i];
-        }
-        int send_num = sendto(sock_fd, d, 13, 0, (struct sockaddr *)&can2_addr_serv, can2_addr_serv_len);
-        // ROS_INFO("send to ip:%s", can2_remote_ip.c_str()); //, can2_addr_serv.sin_addr.s_addr, can2_addr_serv.sin_port);
-        if ( send_num < 0 ) {
-            // ROS_WARN("[CAN_DRIVER] Send data failed, res: %d", send_num);
-            RCLCPP_WARN(this->get_logger(), "[CAN_DRIVER] Send data failed, res: %d", send_num);
-        }
-        break;
-    }
-    default:
-        break;
-    }
+    send_can_frame(sendData);
 
     if (param_show_sending_msg)
     {
@@ -317,84 +311,20 @@ void CAN_app::ecu_cb(const yunle_msgs::msg::Ecu::SharedPtr msg)
 
 void CAN_app::imu_cb(const sensor_msgs::msg::Imu::SharedPtr msg) const
 {
+    // IMU 姿态经协议封装后透传到 CAN。
     sensor_msgs::msg::Imu _msg = *msg;
 
-    SendPostureMsg* sendMsg = new SendPostureMsg(_msg, vehicle_weight);
+    auto sendMsg = std::make_unique<SendPostureMsg>(_msg, vehicle_weight);
     // sendMsg->print();
     VCI_CAN_OBJ sendData = sendMsg->getMessage();
 
-    switch (canbus_type)
-    {
-    case USB2CAN:
-        if (VCI_Transmit(VCI_USBCAN2, CAN_id, main_can_port, &sendData, 1) != 1)
-        {
-            // ROS_INFO("send can id: %02x", CAN_id);
-            // ROS_WARN_STREAM("[can_module] Transmit failed once.");
-            // ROS_INFO_STREAM("VCI_USBCAN2 : " << VCI_USBCAN2);
-            // ROS_INFO_STREAM("CAN_id     : " << CAN_id);
-            // ROS_INFO_STREAM("CAN_port   : " << main_can_port + 1);
-            // ROS_INFO_STREAM("sendData : ");
-
-            RCLCPP_WARN_STREAM(this->get_logger(), "[can_module] Transmit failed once.");
-            RCLCPP_INFO_STREAM(this->get_logger(), "VCI_USBCAN2 : " << VCI_USBCAN2);
-            RCLCPP_INFO_STREAM(this->get_logger(), "CAN_id     : " << CAN_id);
-            RCLCPP_INFO_STREAM(this->get_logger(), "CAN_port   : " << main_can_port + 1);
-            RCLCPP_INFO_STREAM(this->get_logger(), "sendData : ");
-            // sendMsg.print(); // 以十六进制的形式打印ecu->can消息
-        }
-        break;
-    case EthCAN_UDP:
-    {
-        // BYTE *d;
-        // ROS_INFO("1");
-        // memset(d, 0, sizeof(BYTE)*13);
-        // ROS_INFO("2");
-        BYTE d[13];
-        d[0] = (BYTE)sendData.DataLen;
-        d[1] = (BYTE)((0xff000000 & sendData.ID) >> 24);
-        d[2] = (BYTE)((0xff0000 & sendData.ID) >> 16);
-        d[3] = (BYTE)((0xff00 & sendData.ID) >> 8);
-        d[4] = (BYTE)((0xff & sendData.ID));
-        for (int i = 0; i < sendData.DataLen; i++) {
-            d[5+i] = sendData.Data[i];
-        }
-        int send_num = sendto(sock_fd, d, 13, 0, (struct sockaddr *)&can2_addr_serv, can2_addr_serv_len);
-        // ROS_INFO("send to ip:%s", can2_remote_ip.c_str()); //, can2_addr_serv.sin_addr.s_addr, can2_addr_serv.sin_port);
-        if ( send_num < 0 ) {
-            // ROS_WARN("[CAN_DRIVER] Send data failed, res: %d", send_num);
-            RCLCPP_WARN(this->get_logger(), "[CAN_DRIVER] Send data failed, res: %d", send_num);
-        }
-        break;
-    }
-    default:
-        break;
-    }
+    send_can_frame(sendData);
 
     if (param_show_sending_msg)
     {
         sendMsg->print();
     }
 }
-
-class ThreadGuard
-{
-private:
-    pthread_t &t1_;
-    Param *param_;
-
-public:
-    explicit ThreadGuard(pthread_t &t1, Param *param) : t1_(t1), param_(param){};
-    ~ThreadGuard()
-    {
-        if (!t1_)
-        {
-            param->mrun_num = 0;
-            pthread_join(t1_, NULL);
-        }
-    }
-    ThreadGuard(const ThreadGuard &) = delete;
-    ThreadGuard &operator=(const ThreadGuard &) = delete;
-};
 
 void CAN_app::init_usb2can() {
     // p_nh.param<bool>("debug_mode", param_debug, false);
@@ -490,7 +420,7 @@ void CAN_app::init_usb2can() {
     }
 
     config.AccCode = 0;          // 帧过滤验收码,详见说明文档及VCI_InitCAN  // 与AccMask共同决定哪些帧可以被接收
-    config.AccMask = 0xFFFFFFFF; // 帧过滤屏蔽码,当前表示全部接收 TODO
+    config.AccMask = 0xFFFFFFFF; // 帧过滤屏蔽码，当前设置为全接收
     config.Filter = 0;           // 0/1 接收所有类型;2 只接收标准帧;3 只接收扩展帧
     config.Timing0 = 0x00;       // 这两个共同设置波特率,当前表示500k,其他请参照说明文档
     config.Timing1 = 0x1C;
@@ -545,37 +475,28 @@ void CAN_app::run_usb2can() {
     param->vehicle_status_publisher = pub_vehicle_status;
     param->debug_can_port = debug_can_port;
     param->main_can_port = main_can_port;
-    int ret = pthread_create(&threadid, NULL, receive_func, param);
-    ThreadGuard t1{threadid, param};
+    // 启动主接收线程，失败则立刻释放资源并报错。
+    if (pthread_create(&threadid, NULL, receive_func, param) != 0)
+    {
+        RCLCPP_ERROR(this->get_logger(), "[can_module] failed to create receive thread");
+        delete param;
+        param = nullptr;
+        return;
+    }
 
-    pthread_t _thread_debug;
     if (param_debug)
     {
-        // 目前can通道1闲置,因此用来做监听,进行debug
-        int ret1 = pthread_create(&_thread_debug, NULL, thread_debug, param);
-        ThreadGuard t2{_thread_debug, param};
+        // debug 线程监听 debug_can_port，不影响主收发线程。
+        if (pthread_create(&thread_debug_id, NULL, thread_debug, param) != 0)
+        {
+            RCLCPP_WARN(this->get_logger(), "[can_module] failed to create debug thread");
+            thread_debug_id = 0;
+        }
     }
 }
 
 void CAN_app::init_eth_can() {
-    // p_nh.param<std::string>("can_eth_card", can_eth_card, "");
-    // p_nh.param<std::string>("can1_remote_ip", can1_remote_ip, "");
-    // p_nh.param<int>("can1_remote_port", can1_remote_port, 0); // 默认读取can1数据来debug
-    // p_nh.param<std::string>("can2_remote_ip", can2_remote_ip, "");
-    // p_nh.param<int>("can2_remote_port", can2_remote_port, 0); // 默认读取can1数据来debug
-    // p_nh.param<std::string>("local_ip", local_ip, "");
-    // p_nh.param<int>("local_port", local_port, 0); // 默认读取can1数据来debug   
-    // if (can_eth_card == "") {
-    //     ROS_ERROR("[CAN] can_eth_card is not set!");
-    //     exit(1);
-    // }
-
-    // p_nh.param<bool>("debug_mode", param_debug, false); 
-    // p_nh.param<bool>("show_sending_msg", param_show_sending_msg, false);
-    // std::string car_type_str;
-    // p_nh.param<std::string>("car_type", car_type_str, "");
-    /* using ROS2 */
-    //can_eth_card = this->get_parameter("can_eth_card").as_string();
+    // 读取以太网 CAN 参数并初始化 socket。
     this->get_parameter("can_eth_card", can_eth_card);
     this->get_parameter("can1_remote_ip", can1_remote_ip);
     this->get_parameter("can1_remote_port", can1_remote_port);
@@ -640,7 +561,7 @@ void CAN_app::init_eth_can() {
     pre_steer = 0.;
 }
 
-void CAN_app::can_recv_func(int id) {
+void CAN_app::can_recv_func() {
     int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if(sock_fd < 0) {  
         // ROS_ERROR("[CAN] Cannot create socket_fd to listen");
@@ -650,7 +571,7 @@ void CAN_app::can_recv_func(int id) {
 
     /* 将套接字和IP、端口绑定 */  
     struct sockaddr_in addr_serv;  
-    int len;  
+    socklen_t len;
     memset(&addr_serv, 0, sizeof(struct sockaddr_in));  //每个字节都用0填充
     addr_serv.sin_family = AF_INET;
     // addr_serv.sin_port = htons(8002);
@@ -662,22 +583,21 @@ void CAN_app::can_recv_func(int id) {
 
     /* 绑定socket */
     int err_code = bind(sock_fd, (struct sockaddr *)&addr_serv, sizeof(addr_serv));
-    if(err_code < 0) {  
-        // ROS_ERROR("[CAN] Cannot bind socket for listening, err_code: %d", err_code);
+    if(err_code < 0) {
         RCLCPP_ERROR(this->get_logger(), "[CAN] Cannot bind socket for listening, err_code: %d", err_code);
+        close(sock_fd);
         return;
     }
 
     int recv_num;  
-    int send_num;  
-    unsigned char recv_buf[20];  
+        unsigned char recv_buf[20];  
     struct sockaddr_in addr_client;
     // ROS_INFO("[CAN] Listen server is running:\n");  
     RCLCPP_INFO(this->get_logger(), "[CAN] Listen server is running:");  
     // static std::set<int> ids;
     while( rclcpp::ok() ) {  
             
-        recv_num = recvfrom(sock_fd, recv_buf, sizeof(recv_buf), 0, (struct sockaddr *)&addr_client, (socklen_t *)&len);
+        recv_num = recvfrom(sock_fd, recv_buf, sizeof(recv_buf), 0, (struct sockaddr *)&addr_client, &len);
             
         if(recv_num < 0) {  
             // ROS_ERROR("[CAN] Can listen error: recv_num < 0");
@@ -690,15 +610,10 @@ void CAN_app::can_recv_func(int id) {
             continue;
         } 
 
-        // 16进制id
-        int id = ((recv_buf[1] & 0xf0) >> 4 ) * 10000000
-                + ((recv_buf[1] & 0x0f)) * 1000000
-                + ((recv_buf[2] & 0xf0) >> 4 ) * 100000
-                + ((recv_buf[2] & 0x0f)) * 10000
-                + ((recv_buf[3] & 0xf0) >> 4 ) * 1000
-                + ((recv_buf[3] & 0x0f)) * 100
-                + ((recv_buf[4] & 0xf0) >> 4 ) * 10
-                + ((recv_buf[4] & 0x0f));
+        const uint32_t can_id = decode_can_id(recv_buf);
+
+        VCI_CAN_OBJ obj_can{};
+        std::memcpy(obj_can.Data, recv_buf + 5, 8);
         
         // ROS_INFO("received can id: %d", id);
         // RCLCPP_INFO(this->get_logger(), "received can id: %d", id);
@@ -709,63 +624,46 @@ void CAN_app::can_recv_func(int id) {
         // }
         // ROS_INFO("received can id list: %s", info.c_str());
         // RCLCPP_INFO(this->get_logger(), "received can id list: %s", info.c_str());
-        switch (id)
+        switch (can_id)
         {
-        case 51:
+        case 0x51:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             VehicleStatusMsg obj_vehicle(obj_can);
             yunle_msgs::msg::VehicleStatus msg_vehicle_status = obj_vehicle.getMessage();
             // msg_vehicle_status.Header.stamp = ros::Time::now();
             // msg_vehicle_status.header.stamp = this->get_clock()->now();
-            msg_vehicle_status.header.stamp = rclcpp::Clock().now();
+            static rclcpp::Clock ros_clock(RCL_ROS_TIME);
+            msg_vehicle_status.header.stamp = ros_clock.now();
             msg_vehicle_status.left_wheel_speed = left_wheel_speed;
             msg_vehicle_status.right_wheel_speed = right_wheel_speed;
             // pub_vehicle_status.publish(msg_vehicle_status);
             pub_vehicle_status->publish(msg_vehicle_status);
             break;
         }
-        case 281:
+        case 0x281:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             WheelSpeed_28x obj_wheel_speed(obj_can);
             left_wheel_speed = obj_wheel_speed.get_speed_rpm();
 			// 281的mcu轮速反馈与实际值相反
-            left_wheel_speed = -left_wheel_speed * wheel_radius*2*3.141592654/60;
+            left_wheel_speed = -left_wheel_speed * wheel_radius * kRpmToMps;
             break;
         }
-        case 282:
+        case 0x282:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             WheelSpeed_28x obj_wheel_speed(obj_can);
             right_wheel_speed = obj_wheel_speed.get_speed_rpm();
-            right_wheel_speed = right_wheel_speed * wheel_radius*2*3.141592654/60;
+            right_wheel_speed = right_wheel_speed * wheel_radius * kRpmToMps;
             break;
         }
 
-        case 168:
+        case 0x168:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             WheelSpeed obj_wheel_speed(obj_can);
-            float front_left    = obj_wheel_speed.get_front_left_rpm();
-            float front_right   = obj_wheel_speed.get_front_right_rpm();
-            float rear_left     = obj_wheel_speed.get_rear_left_rpm();
-            float rear_right    = obj_wheel_speed.get_rear_right_rpm();
+            const float front_left = obj_wheel_speed.get_front_left_rpm();
+            const float front_right = obj_wheel_speed.get_front_right_rpm();
 
-            left_wheel_speed  = front_left * wheel_radius*2*3.141592654/60;
-            right_wheel_speed = front_right* wheel_radius*2*3.141592654/60;
+            left_wheel_speed = front_left * wheel_radius * kRpmToMps;
+            right_wheel_speed = front_right * wheel_radius * kRpmToMps;
 			
 			//std::cout << "right wheel rpm 168 front_left:"<< front_left<< std::endl;
 			//std::cout << "right wheel rpm 168 front_right:"<< front_right<< std::endl;
@@ -775,12 +673,8 @@ void CAN_app::can_recv_func(int id) {
         }
 
 
-        case 17904001:
+        case 0x17904001:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             BatteryMsg obj_battery(obj_can, true);
             yunle_msgs::msg::Battery msg_battery = obj_battery.getMessage();
             // pub_battery_status.publish(msg_battery);
@@ -788,27 +682,21 @@ void CAN_app::can_recv_func(int id) {
             break;
         }
 
-        case 178:
+        case 0x178:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             WheelStatus msg_factory(obj_can, WHEEL_LEFT);
             msg_factory.init();
-            left_wheel_speed = msg_factory.get_rpm()*wheel_radius*2*3.141592654/60;
+            left_wheel_speed = msg_factory.get_rpm() * wheel_radius * kRpmToMps;
             // ROS_INFO(" left rpm: %d", msg_factory.get_rpm());
+            break;
         }
 
-        case 188:
+        case 0x188:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             WheelStatus msg_factory(obj_can, WHEEL_RIGHT);
-            right_wheel_speed = msg_factory.get_rpm()*wheel_radius*2*3.141592654/60;
+            right_wheel_speed = msg_factory.get_rpm() * wheel_radius * kRpmToMps;
             // ROS_INFO("right rpm: %d", msg_factory.get_rpm());
+            break;
         }
 
         default:
@@ -852,7 +740,7 @@ void CAN_app::run_eth_can() {
     can2_addr_serv.sin_port = htons(can2_remote_port);
     can2_addr_serv_len = sizeof(can2_addr_serv);
 
-    this->tasks.push_back(std::thread(&CAN_app::can_recv_func, this, 1));
+    this->tasks.push_back(std::thread(&CAN_app::can_recv_func, this));
     // sub_ecu = nh.subscribe("ecu", 10, &CAN_app::ecu_cb, this);
     // sub_imu = nh.subscribe("imu_raw", 10, &CAN_app::imu_cb, this);
 
@@ -889,10 +777,7 @@ void CAN_app::run()
         break;
     }
 
+    // 统一由主入口控制 shutdown，这里只负责 spin。
     rclcpp::spin(this->shared_from_this());
-    rclcpp::shutdown();
-    // ros::spin();
-    // ros::shutdown();
 }
-};  // namespace USB2CAN
-    // 写在最后: 除收发函数外，其它的函数调用前后，最好加个毫秒级的延时，即不影响程序的运行，又可以让USBCAN设备有充分的时间处理指令。
+} // namespace USB2CAN
