@@ -6,6 +6,17 @@
 
 namespace USB2CAN
 {
+namespace {
+constexpr double kRpmToMps = 2.0 * 3.141592654 / 60.0;
+
+inline uint32_t decode_can_id(const unsigned char *buf)
+{
+    return (static_cast<uint32_t>(buf[1]) << 24) |
+           (static_cast<uint32_t>(buf[2]) << 16) |
+           (static_cast<uint32_t>(buf[3]) << 8) |
+           static_cast<uint32_t>(buf[4]);
+}
+} // namespace
 void *receive_func(void *param_in)
 {
     Param *param = (Param *)param_in;
@@ -28,7 +39,8 @@ void *receive_func(void *param_in)
                     yunle_msgs::msg::VehicleStatus msg_vehicle_status = msg_factory.getMessage();
                     // msg_vehicle_status.Header.stamp = ros::Time::now();
                     //msg_vehicle_status.header.stamp = this->get_clock()->now();
-                    msg_vehicle_status.header.stamp = rclcpp::Clock().now();
+                    static rclcpp::Clock ros_clock(RCL_ROS_TIME);
+                    msg_vehicle_status.header.stamp = ros_clock.now();
                     
                     msg_vehicle_status.left_wheel_speed = left_wheel_speed;
                     msg_vehicle_status.right_wheel_speed = right_wheel_speed;
@@ -41,10 +53,10 @@ void *receive_func(void *param_in)
                     pub_battery_status_->publish(msg_battery_status);
                 }else if(rec[i].ID == 0x178) {      // 左轮转速
                     WheelStatus msg_factory(rec[i], WHEEL_LEFT);
-                    left_wheel_speed = msg_factory.get_rpm() * wheel_radius * 2 * 3.141592654 / 60;
+                    left_wheel_speed = msg_factory.get_rpm() * wheel_radius * kRpmToMps;
                 }else if(rec[i].ID == 0x188) {      // 右轮转速
                     WheelStatus msg_factory(rec[i], WHEEL_RIGHT);
-                    right_wheel_speed = msg_factory.get_rpm() * wheel_radius * 2 * 3.141592654 / 60;
+                    right_wheel_speed = msg_factory.get_rpm() * wheel_radius * kRpmToMps;
                 }
             }
         }
@@ -214,6 +226,45 @@ void CAN_app::convertStringToType(const std::string &str)
     }
 }
 
+bool CAN_app::send_can_frame(const VCI_CAN_OBJ &send_data) const
+{
+    switch (canbus_type)
+    {
+    case USB2CAN:
+    {
+        VCI_CAN_OBJ tx_data = send_data;
+        if (VCI_Transmit(VCI_USBCAN2, CAN_id, main_can_port, &tx_data, 1) == 1)
+        {
+            return true;
+        }
+        RCLCPP_WARN_STREAM(this->get_logger(), "[can_module] Transmit failed once.");
+        return false;
+    }
+
+    case EthCAN_UDP:
+    {
+        BYTE d[13] = {0};
+        d[0] = static_cast<BYTE>(send_data.DataLen);
+        d[1] = static_cast<BYTE>((0xff000000 & send_data.ID) >> 24);
+        d[2] = static_cast<BYTE>((0x00ff0000 & send_data.ID) >> 16);
+        d[3] = static_cast<BYTE>((0x0000ff00 & send_data.ID) >> 8);
+        d[4] = static_cast<BYTE>(0x000000ff & send_data.ID);
+        std::memcpy(&d[5], send_data.Data, send_data.DataLen);
+        const int send_num = sendto(sock_fd, d, sizeof(d), 0,
+                                    reinterpret_cast<const struct sockaddr *>(&can2_addr_serv),
+                                    can2_addr_serv_len);
+        if (send_num < 0)
+        {
+            RCLCPP_WARN(this->get_logger(), "[CAN_DRIVER] Send data failed, res: %d", send_num);
+            return false;
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 void CAN_app::ecu_cb(const yunle_msgs::msg::Ecu::SharedPtr msg)
 {
     // 回调尽量只做协议转换与发送，避免重逻辑阻塞订阅线程。
@@ -245,66 +296,12 @@ void CAN_app::ecu_cb(const yunle_msgs::msg::Ecu::SharedPtr msg)
         return;
     }
 
-    // if(car_type == NWD){
-    //     sendMsg = std::make_unique<MsgNWD>(_msg, pre_steer);
-    // }else if(car_type == JD03){
-    //     sendMsg = new MsgJD03(_msg, pre_steer);
-    // }else{
-    //     ROS_WARN_STREAM("This driver only supports NWD series and JD03. Confirm your vehicle type.");
-    //     return;
-    // }
-
     pre_steer = _msg.steer;
     //VCI_CAN_OBJ sendData = sendMsg.getMessage();
     VCI_CAN_OBJ sendData = sendMsg->getMessage();
     // ROS_INFO_STREAM("set wheel angle to can, data = " << _msg.steer * 10);
 
-    switch (canbus_type)
-    {
-    case USB2CAN:
-        if (VCI_Transmit(VCI_USBCAN2, CAN_id, main_can_port, &sendData, 1) != 1)
-        {
-            // ROS_INFO("send can id: %02x", CAN_id);
-            // ROS_WARN_STREAM("[can_module] Transmit failed once.");
-            // ROS_INFO_STREAM("VCI_USBCAN2 : " << VCI_USBCAN2);
-            // ROS_INFO_STREAM("CAN_id     : " << CAN_id);
-            // ROS_INFO_STREAM("CAN_port   : " << main_can_port + 1);
-            // ROS_INFO_STREAM("sendData : ");
-            RCLCPP_WARN_STREAM(this->get_logger(), "[can_module] Transmit failed once.");
-            RCLCPP_INFO_STREAM(this->get_logger(), "VCI_USBCAN2 : " << VCI_USBCAN2);
-            RCLCPP_INFO_STREAM(this->get_logger(), "CAN_id     : " << CAN_id);
-            RCLCPP_INFO_STREAM(this->get_logger(), "CAN_port   : " << main_can_port + 1);
-            RCLCPP_INFO_STREAM(this->get_logger(), "sendData : ");
-
-            // sendMsg.print(); // 以十六进制的形式打印ecu->can消息
-        }
-        break;
-    case EthCAN_UDP:
-    {
-        // BYTE *d;
-        // ROS_INFO("1");
-        // memset(d, 0, sizeof(BYTE)*13);
-        // ROS_INFO("2");
-        BYTE d[13];
-        d[0] = (BYTE)sendData.DataLen;
-        d[1] = (BYTE)((0xff000000 & sendData.ID) >> 24);
-        d[2] = (BYTE)((0xff0000 & sendData.ID) >> 16);
-        d[3] = (BYTE)((0xff00 & sendData.ID) >> 8);
-        d[4] = (BYTE)((0xff & sendData.ID));
-        for (int i = 0; i < sendData.DataLen; i++) {
-            d[5+i] = sendData.Data[i];
-        }
-        int send_num = sendto(sock_fd, d, 13, 0, (struct sockaddr *)&can2_addr_serv, can2_addr_serv_len);
-        // ROS_INFO("send to ip:%s", can2_remote_ip.c_str()); //, can2_addr_serv.sin_addr.s_addr, can2_addr_serv.sin_port);
-        if ( send_num < 0 ) {
-            // ROS_WARN("[CAN_DRIVER] Send data failed, res: %d", send_num);
-            RCLCPP_WARN(this->get_logger(), "[CAN_DRIVER] Send data failed, res: %d", send_num);
-        }
-        break;
-    }
-    default:
-        break;
-    }
+    send_can_frame(sendData);
 
     if (param_show_sending_msg)
     {
@@ -321,52 +318,7 @@ void CAN_app::imu_cb(const sensor_msgs::msg::Imu::SharedPtr msg) const
     // sendMsg->print();
     VCI_CAN_OBJ sendData = sendMsg->getMessage();
 
-    switch (canbus_type)
-    {
-    case USB2CAN:
-        if (VCI_Transmit(VCI_USBCAN2, CAN_id, main_can_port, &sendData, 1) != 1)
-        {
-            // ROS_INFO("send can id: %02x", CAN_id);
-            // ROS_WARN_STREAM("[can_module] Transmit failed once.");
-            // ROS_INFO_STREAM("VCI_USBCAN2 : " << VCI_USBCAN2);
-            // ROS_INFO_STREAM("CAN_id     : " << CAN_id);
-            // ROS_INFO_STREAM("CAN_port   : " << main_can_port + 1);
-            // ROS_INFO_STREAM("sendData : ");
-
-            RCLCPP_WARN_STREAM(this->get_logger(), "[can_module] Transmit failed once.");
-            RCLCPP_INFO_STREAM(this->get_logger(), "VCI_USBCAN2 : " << VCI_USBCAN2);
-            RCLCPP_INFO_STREAM(this->get_logger(), "CAN_id     : " << CAN_id);
-            RCLCPP_INFO_STREAM(this->get_logger(), "CAN_port   : " << main_can_port + 1);
-            RCLCPP_INFO_STREAM(this->get_logger(), "sendData : ");
-            // sendMsg.print(); // 以十六进制的形式打印ecu->can消息
-        }
-        break;
-    case EthCAN_UDP:
-    {
-        // BYTE *d;
-        // ROS_INFO("1");
-        // memset(d, 0, sizeof(BYTE)*13);
-        // ROS_INFO("2");
-        BYTE d[13];
-        d[0] = (BYTE)sendData.DataLen;
-        d[1] = (BYTE)((0xff000000 & sendData.ID) >> 24);
-        d[2] = (BYTE)((0xff0000 & sendData.ID) >> 16);
-        d[3] = (BYTE)((0xff00 & sendData.ID) >> 8);
-        d[4] = (BYTE)((0xff & sendData.ID));
-        for (int i = 0; i < sendData.DataLen; i++) {
-            d[5+i] = sendData.Data[i];
-        }
-        int send_num = sendto(sock_fd, d, 13, 0, (struct sockaddr *)&can2_addr_serv, can2_addr_serv_len);
-        // ROS_INFO("send to ip:%s", can2_remote_ip.c_str()); //, can2_addr_serv.sin_addr.s_addr, can2_addr_serv.sin_port);
-        if ( send_num < 0 ) {
-            // ROS_WARN("[CAN_DRIVER] Send data failed, res: %d", send_num);
-            RCLCPP_WARN(this->get_logger(), "[CAN_DRIVER] Send data failed, res: %d", send_num);
-        }
-        break;
-    }
-    default:
-        break;
-    }
+    send_can_frame(sendData);
 
     if (param_show_sending_msg)
     {
@@ -609,7 +561,7 @@ void CAN_app::init_eth_can() {
     pre_steer = 0.;
 }
 
-void CAN_app::can_recv_func(int id) {
+void CAN_app::can_recv_func() {
     int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if(sock_fd < 0) {  
         // ROS_ERROR("[CAN] Cannot create socket_fd to listen");
@@ -619,7 +571,7 @@ void CAN_app::can_recv_func(int id) {
 
     /* 将套接字和IP、端口绑定 */  
     struct sockaddr_in addr_serv;  
-    int len;  
+    socklen_t len;
     memset(&addr_serv, 0, sizeof(struct sockaddr_in));  //每个字节都用0填充
     addr_serv.sin_family = AF_INET;
     // addr_serv.sin_port = htons(8002);
@@ -631,22 +583,21 @@ void CAN_app::can_recv_func(int id) {
 
     /* 绑定socket */
     int err_code = bind(sock_fd, (struct sockaddr *)&addr_serv, sizeof(addr_serv));
-    if(err_code < 0) {  
-        // ROS_ERROR("[CAN] Cannot bind socket for listening, err_code: %d", err_code);
+    if(err_code < 0) {
         RCLCPP_ERROR(this->get_logger(), "[CAN] Cannot bind socket for listening, err_code: %d", err_code);
+        close(sock_fd);
         return;
     }
 
     int recv_num;  
-    int send_num;  
-    unsigned char recv_buf[20];  
+        unsigned char recv_buf[20];  
     struct sockaddr_in addr_client;
     // ROS_INFO("[CAN] Listen server is running:\n");  
     RCLCPP_INFO(this->get_logger(), "[CAN] Listen server is running:");  
     // static std::set<int> ids;
     while( rclcpp::ok() ) {  
             
-        recv_num = recvfrom(sock_fd, recv_buf, sizeof(recv_buf), 0, (struct sockaddr *)&addr_client, (socklen_t *)&len);
+        recv_num = recvfrom(sock_fd, recv_buf, sizeof(recv_buf), 0, (struct sockaddr *)&addr_client, &len);
             
         if(recv_num < 0) {  
             // ROS_ERROR("[CAN] Can listen error: recv_num < 0");
@@ -659,15 +610,10 @@ void CAN_app::can_recv_func(int id) {
             continue;
         } 
 
-        // 16进制id
-        int id = ((recv_buf[1] & 0xf0) >> 4 ) * 10000000
-                + ((recv_buf[1] & 0x0f)) * 1000000
-                + ((recv_buf[2] & 0xf0) >> 4 ) * 100000
-                + ((recv_buf[2] & 0x0f)) * 10000
-                + ((recv_buf[3] & 0xf0) >> 4 ) * 1000
-                + ((recv_buf[3] & 0x0f)) * 100
-                + ((recv_buf[4] & 0xf0) >> 4 ) * 10
-                + ((recv_buf[4] & 0x0f));
+        const uint32_t can_id = decode_can_id(recv_buf);
+
+        VCI_CAN_OBJ obj_can{};
+        std::memcpy(obj_can.Data, recv_buf + 5, 8);
         
         // ROS_INFO("received can id: %d", id);
         // RCLCPP_INFO(this->get_logger(), "received can id: %d", id);
@@ -678,63 +624,46 @@ void CAN_app::can_recv_func(int id) {
         // }
         // ROS_INFO("received can id list: %s", info.c_str());
         // RCLCPP_INFO(this->get_logger(), "received can id list: %s", info.c_str());
-        switch (id)
+        switch (can_id)
         {
-        case 51:
+        case 0x51:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             VehicleStatusMsg obj_vehicle(obj_can);
             yunle_msgs::msg::VehicleStatus msg_vehicle_status = obj_vehicle.getMessage();
             // msg_vehicle_status.Header.stamp = ros::Time::now();
             // msg_vehicle_status.header.stamp = this->get_clock()->now();
-            msg_vehicle_status.header.stamp = rclcpp::Clock().now();
+            static rclcpp::Clock ros_clock(RCL_ROS_TIME);
+            msg_vehicle_status.header.stamp = ros_clock.now();
             msg_vehicle_status.left_wheel_speed = left_wheel_speed;
             msg_vehicle_status.right_wheel_speed = right_wheel_speed;
             // pub_vehicle_status.publish(msg_vehicle_status);
             pub_vehicle_status->publish(msg_vehicle_status);
             break;
         }
-        case 281:
+        case 0x281:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             WheelSpeed_28x obj_wheel_speed(obj_can);
             left_wheel_speed = obj_wheel_speed.get_speed_rpm();
 			// 281的mcu轮速反馈与实际值相反
-            left_wheel_speed = -left_wheel_speed * wheel_radius*2*3.141592654/60;
+            left_wheel_speed = -left_wheel_speed * wheel_radius * kRpmToMps;
             break;
         }
-        case 282:
+        case 0x282:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             WheelSpeed_28x obj_wheel_speed(obj_can);
             right_wheel_speed = obj_wheel_speed.get_speed_rpm();
-            right_wheel_speed = right_wheel_speed * wheel_radius*2*3.141592654/60;
+            right_wheel_speed = right_wheel_speed * wheel_radius * kRpmToMps;
             break;
         }
 
-        case 168:
+        case 0x168:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             WheelSpeed obj_wheel_speed(obj_can);
-            float front_left    = obj_wheel_speed.get_front_left_rpm();
-            float front_right   = obj_wheel_speed.get_front_right_rpm();
-            float rear_left     = obj_wheel_speed.get_rear_left_rpm();
-            float rear_right    = obj_wheel_speed.get_rear_right_rpm();
+            const float front_left = obj_wheel_speed.get_front_left_rpm();
+            const float front_right = obj_wheel_speed.get_front_right_rpm();
 
-            left_wheel_speed  = front_left * wheel_radius*2*3.141592654/60;
-            right_wheel_speed = front_right* wheel_radius*2*3.141592654/60;
+            left_wheel_speed = front_left * wheel_radius * kRpmToMps;
+            right_wheel_speed = front_right * wheel_radius * kRpmToMps;
 			
 			//std::cout << "right wheel rpm 168 front_left:"<< front_left<< std::endl;
 			//std::cout << "right wheel rpm 168 front_right:"<< front_right<< std::endl;
@@ -744,12 +673,8 @@ void CAN_app::can_recv_func(int id) {
         }
 
 
-        case 17904001:
+        case 0x17904001:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             BatteryMsg obj_battery(obj_can, true);
             yunle_msgs::msg::Battery msg_battery = obj_battery.getMessage();
             // pub_battery_status.publish(msg_battery);
@@ -757,27 +682,21 @@ void CAN_app::can_recv_func(int id) {
             break;
         }
 
-        case 178:
+        case 0x178:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             WheelStatus msg_factory(obj_can, WHEEL_LEFT);
             msg_factory.init();
-            left_wheel_speed = msg_factory.get_rpm()*wheel_radius*2*3.141592654/60;
+            left_wheel_speed = msg_factory.get_rpm() * wheel_radius * kRpmToMps;
             // ROS_INFO(" left rpm: %d", msg_factory.get_rpm());
+            break;
         }
 
-        case 188:
+        case 0x188:
         {
-            VCI_CAN_OBJ obj_can;
-            for (int i = 0; i < 8; i++) {
-                obj_can.Data[i] = recv_buf[i+5];
-            }
             WheelStatus msg_factory(obj_can, WHEEL_RIGHT);
-            right_wheel_speed = msg_factory.get_rpm()*wheel_radius*2*3.141592654/60;
+            right_wheel_speed = msg_factory.get_rpm() * wheel_radius * kRpmToMps;
             // ROS_INFO("right rpm: %d", msg_factory.get_rpm());
+            break;
         }
 
         default:
@@ -821,7 +740,7 @@ void CAN_app::run_eth_can() {
     can2_addr_serv.sin_port = htons(can2_remote_port);
     can2_addr_serv_len = sizeof(can2_addr_serv);
 
-    this->tasks.push_back(std::thread(&CAN_app::can_recv_func, this, 1));
+    this->tasks.push_back(std::thread(&CAN_app::can_recv_func, this));
     // sub_ecu = nh.subscribe("ecu", 10, &CAN_app::ecu_cb, this);
     // sub_imu = nh.subscribe("imu_raw", 10, &CAN_app::imu_cb, this);
 

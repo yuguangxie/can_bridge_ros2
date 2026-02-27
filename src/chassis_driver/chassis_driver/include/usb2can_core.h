@@ -28,6 +28,7 @@
 #include <netinet/in.h>   
 #include <arpa/inet.h>   
 #include <vector>
+#include <cstring>
 #include <thread>
 
 namespace USB2CAN
@@ -122,8 +123,6 @@ private:
 
   std::vector<std::thread> tasks;
 
-  void initROS();
-
   void ecu_cb(const yunle_msgs::msg::Ecu::SharedPtr  msg);
   // void ecu_cb(const yunle_msgs::msg::ecu::ConstPtr &msg);
 
@@ -131,6 +130,7 @@ private:
   // void imu_cb(const sensor_msgs::msg::Imu::ConstPtr &msg);
 
   void convertStringToType(const std::string &str);
+  bool send_can_frame(const VCI_CAN_OBJ &send_data) const;
 
 public:
   CAN_app();
@@ -141,7 +141,7 @@ public:
   
   void init_eth_can();
   void run_eth_can();
-  void can_recv_func(int id);
+  void can_recv_func();
 
   void run();
 
