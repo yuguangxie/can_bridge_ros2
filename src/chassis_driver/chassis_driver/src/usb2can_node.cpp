@@ -1,22 +1,15 @@
 #include "usb2can_core.h"
-#include <iostream>
-// #include <ros/ros.h>
 #include <rclcpp/rclcpp.hpp>
 
-
-
+// 节点主入口：仅负责生命周期控制，具体业务逻辑由 CAN_app 实现。
 int main(int argc, char **argv)
 {
-    // ros::init(argc, argv, "can_module");
-    
-    // USB2CAN::CAN_app app;
-    // app.run();
-
     rclcpp::init(argc, argv);
+
     auto node = std::make_shared<USB2CAN::CAN_app>();
+    // run() 内部根据参数选择 USB2CAN 或 EthCAN_UDP 模式。
     node->run();
-    // rclcpp::spin(std::make_shared<USB2CAN::CAN_app>());
-    // rclcpp::spin(node);
+
     rclcpp::shutdown();
     return 0;
 }
